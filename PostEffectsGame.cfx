@@ -34,7 +34,7 @@ float Script : STANDARDSGLOBAL
 
 sampler2D noiseSampler : register (s5)
 {
-  Texture = Shaders\Textures\NoiseHighFrequency.dds;//sbilikiewicz
+  Texture = Shaders\Textures\NoiseHighFrequency.dds;
   MinFilter = POINT;
   MagFilter = POINT;
   MipFilter = POINT; 
@@ -44,7 +44,7 @@ sampler2D noiseSampler : register (s5)
 
 sampler2D perlinNoiseSampler : register (s6)
 {
-  Texture = Shaders\Textures\perlinNoise_sum.dds;//sbilikiewicz
+  Texture = Shaders\Textures\perlinNoise_sum.dds;
   MinFilter = POINT;
   MagFilter = POINT;
   MipFilter = POINT;
@@ -129,7 +129,6 @@ pixout vmNoisyPS(vtxOutVmNoisy IN)
   
   half fScale=0.2;
    
-  
   half4 noiseColor = tex2D(_tex2, IN.baseTC1.xy);      
       
   // fetch noisy stripes
