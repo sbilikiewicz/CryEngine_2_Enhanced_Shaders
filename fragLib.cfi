@@ -1,0 +1,661 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Source File.
+//  Shader extension
+//  Copyright (C), Crytek Studios, 2001-2004.
+// -------------------------------------------------------------------------
+//  File name:   fragLib.cfi
+//  Version:     v1.00
+//  Created:     10/09/2006 by Tiago Sousa
+//  Compilers:   
+//  Description: Common fragment program - unified shading across CryEngine2
+//
+// -------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////
+
+#include "CommonRAM.cfi"
+
+//////////////////////////////// Shared fragment shader /////////////////////////
+
+/*
+
+// Dependencies:
+
+struct fragPass
+{
+  fragInput IN;
+
+  // Usage flags fo shared stuff   
+  bool bRenormalizeNormal;
+  bool bForceRenormalizeNormal; 
+  bool bDiffuseBump;
+  bool bOffsetBumpMapping;
+  bool bParallaxOcclusionMapping;  
+  bool bVertexColors;      // apply vertex color to final result
+  bool bAlphaGlow;         // use diffuse texture alpha has glow
+  int  nReflectionMapping; // reflection mapping type (0: off, 1: cube map, 2: spherical)
+  half fBumpHeightScale;
+  half fSelfShadowStrength;
+  
+  // shared fields
+  int nQuality;           // shader quality level
+  
+  float3x3 mTangentToWS;  // tangent to world space transformation matrix - might be required for some vectors
+  half3 vView;           // eye vector
+  half3 vNormal;         // normal vector
+  half3 vNormalDiffuse;  // diffuse normal vector
+  half3 vReflVec;        // reflection vector
+          
+  half3 cBumpMap;        // tangent space normal map
+  half4 cDiffuseMap;     // diffuse map
+  half4 cGlossMap;       // specular/gloss map
+  half3 cEnvironment;    // environment map
+
+  half fNdotE;           // per pass constant NdotE
+  half fSpecPow;         // specular power
+  half fAlpha;           // opacity   
+      
+  // Note: parser bug, assumes fReflectionAmount, fFresnelBias, etc, are same as tweakable parameters, therefore the _ was added
+  
+  half fReflection_Amount;  // amount of reflection  
+  half fFresnel_Bias;     // fresnel biasing
+  half fFresnel_Scale;    // fresnel scale
+  half fFresnel;         // final fresnel term
+  
+  half fAlphaGlowMultiplier;   // apply multiplier to diffuse alpha glow 
+               
+  // Custom per pass data   
+  fragPassCustom pCustom;
+}
+
+struct fragLightPass
+{
+  half3 cDiffuse;    // light diffuse color
+  half3 cSpecular;   // light specular color
+  half3 cFilter;     // light filter color
+  half3 vLight;      // light vector
+    
+  half fNdotL;       // normal dot light
+  half fFallOff;     // light attenuation  
+  half fOcclShadow;  // light shadow term
+  
+  half3 cOut;        // light final contribution  
+
+  // ... Custom per light data ...
+  fragLightPassCustom pCustom;
+}
+
+frag_unify_parameters( inout fragPass pPass )
+  - Where user unifies parameters (from tweakables, etc) and sets flags (like bDiffuseBump)
+
+frag_custom_begin(in vert2FragGeneral IN, inout fragCustomPass pPass)  
+  - Customized initialization like fetching required textures, do pre-multiplications/computations, etc.  
+  - This is specific for a rendering pass
+  - In fragPass structure, user can add custom data (like for ex reflection vector, reflection color,
+  or some constant term like fFresnel)
+  
+frag_custom_ambient(in fragCustomPass pPass, inout half3 cAmbient ) 
+  - Customized ambient pass, for adding reflections or diferent ambient terms, etc
+  - cAmbient at input is ambient color (or spherical harmonics ambient term)
+  - User can apply diffuse texture or some custom computation (for example, cloth uses a fuzzy term for ambient instead)
+
+frag_custom_per_light(in fragCustomPass pPass, inout fragLightPass pLight)
+  - Custom shading computations
+  - This is executed once per-light source
+  - User can add custom per-light data into fragLightPass structure  
+  
+void frag_final_composition( inout fragPass pPass, inout half3 cFinal )
+  - shared final shading composition
+    
+frag_custom_end(in vert2FragGeneral IN, in fragCustomPass pPass, inout half3 cOut)
+  - Customized pass finalization (like applying vertex colors, alphaglow, etc)
+    
+. Check HumanSkin.cfx shader for simple usage example
+  
+*/
+
+void frag_unify(inout fragPass pPass, in vert2FragGeneral IN)
+{
+  // Set quality level (LOW or HIGH)
+  pPass.nQuality = GetShaderQuality();
+
+  pPass.IN.baseTC = IN.baseTC;
+  pPass.IN.bumpTC = pPass.IN.baseTC;
+  pPass.IN.vTangent = IN.vTangent;
+  pPass.IN.vBinormal = IN.vBinormal;
+  pPass.IN.vNormal.xyz = (cross(IN.vTangent.xyz, IN.vBinormal.xyz)) * IN.vTangent.w;                  // 4 alu
+  pPass.IN.vView = IN.vView;
+  pPass.IN.screenProj = IN.screenProj;
+  pPass.IN.Ambient = IN.Ambient;
+  
+#if %_LT_LIGHTS && %_LT_HASPROJ  
+  pPass.IN.projTC = IN.projTC;
+#endif    
+
+  pPass.IN.Color = IN.Color;
+
+#if %_RT_AMBIENT_OCCLUSION && %_RT_AMBIENT && !%_RT_RAE_GEOMTERM
+  pPass.IN.OutdoorAOInfo.xyz = float3( IN.baseTC.wz, IN.screenProj.z);
+#endif  
+
+#if %_RT_DECAL_TEXGEN_2D || %_RT_DECAL_TEXGEN_3D
+  pPass.IN.DistAtten = IN.DistAtten;
+#elif %_RT_FOG
+  pPass.IN.AvgFogVolumeContrib = IN.AvgFogVolumeContrib;
+#endif
+
+ #if D3D10
+  #if %_RT_NOZPASS && %_RT_ALPHATEST
+	 pPass.IN.AlphaTest = IN.AlphaTest;
+  #endif
+ #endif 
+ 
+  frag_unify_parameters( pPass );
+      
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_final_composition( inout fragPass pPass, inout half3 cFinal )
+{  
+  half3 cDiffuse = ( pPass.cAmbientAcc.xyz + pPass.cDiffuseAcc.xyz ) * pPass.cDiffuseMap.xyz;  // 3 alu
+  if( pPass.nQuality != QUALITY_LOW )
+    cDiffuse.xyz *= MatDifColor.xyz;
+      
+  if( pPass.nReflectionMapping )
+  {
+    // apply shading to environment map
+    pPass.cEnvironment.xyz *= ( pPass.cAmbientAcc.xyz + pPass.cDiffuseAcc.xyz ) ;                 // 2 alu
+    pPass.cSpecularAcc.xyz += pPass.cEnvironment.xyz;                                // 1 alu        
+  }
+  
+  half3 cSpecular = pPass.cSpecularAcc.xyz * pPass.cGlossMap.xyz;                    // 2 alu
+  if( pPass.nQuality != QUALITY_LOW )
+    cSpecular.xyz *= MatSpecColor.xyz;
+  
+  cFinal.xyz += cDiffuse;
+  cFinal.xyz += cSpecular;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_quality_setup( inout fragPass pPass )
+{
+  // Set quality level (LOW, MEDIUM, HIGH or MAX)
+  pPass.nQuality = GetShaderQuality();
+
+  // Check quality settings and disable stuff 
+
+  if( pPass.nQuality == QUALITY_LOW )
+  {
+    pPass.bDiffuseBump = false;
+    pPass.bOffsetBumpMapping = false;
+    pPass.bParallaxOcclusionMapping = false;
+    pPass.bRenormalizeNormal = pPass.bForceRenormalizeNormal;
+    pPass.nReflectionMapping = false;
+    pPass.bDetailBumpMapping = false;
+  }
+
+  if( pPass.nQuality == QUALITY_MEDIUM )
+  {
+    pPass.bDiffuseBump = false;
+    pPass.bOffsetBumpMapping = false;    
+    pPass.bParallaxOcclusionMapping = false;
+    pPass.bDetailBumpMapping = false;
+  }
+
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Setup final fog. Per-vertex for alpha blended objects and per-object volumetric fog
+
+void frag_fog_setup( inout fragPass pPass, inout half4 cOut)
+{
+
+#if D3D10
+
+  if( !pPass.bDisableAlphaTestD3D10 )
+  {
+
+   #if %_RT_NOZPASS && %_RT_ALPHATEST
+    clip(pPass.cDiffuseMap.w - pPass.IN.AlphaTest.w); //need to perform texkill in DX10
+   #endif 
+
+  }
+#endif
+
+#if %_RT_FOG && (!%_RT_DECAL_TEXGEN_2D || !%_RT_DECAL_TEXGEN_3D)
+  ComputeGlobalFogPS(cOut.xyz, pPass.IN.vView.w);
+
+  cOut.xyz = pPass.IN.AvgFogVolumeContrib.xyz + cOut.xyz * pPass.IN.AvgFogVolumeContrib.w;
+  cOut.w *= pPass.IN.vView.w;
+
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half4 frag_shared_output(inout fragPass pPass)
+{ 
+  half4 cOut = 0;     
+
+  frag_quality_setup( pPass );
+
+  #if %_LT_LIGHTS    
+    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);                    
+  #else
+    pPass.cShadowOcclMap = 1;
+  #endif
+
+  float4 baseTC = pPass.IN.baseTC;
+  float4 bumpTC = pPass.IN.bumpTC;
+
+  pPass.vView = normalize(-pPass.IN.vView.xyz);                                                           // 3 alu  
+  pPass.mTangentToWS = float3x3(pPass.IN.vTangent.xyz, pPass.IN.vBinormal.xyz, pPass.IN.vNormal.xyz);  
+      
+  if (pPass.bOffsetBumpMapping)
+  {
+    half fHeight = EXPAND(tex2D(bumpHeightMapSampler, bumpTC.xy).a);
+
+    fHeight *= pPass.fBumpHeightScale;
+    half3 vVec = mul(pPass.mTangentToWS, pPass.vView);
+    baseTC.xy = baseTC.xy + vVec.xy * fHeight;
+    bumpTC.xy = bumpTC.xy + vVec.xy * fHeight;
+    pPass.IN.baseTC.xy = baseTC.xy;
+    pPass.IN.bumpTC.xy = bumpTC.xy;
+  }
+
+	if (pPass.bParallaxOcclusionMapping)
+  {
+    //float lodDiffuse = ComputeTextureLOD(baseTC.xy, ResInfoDiffuse.xy);
+  	float2 ddx_baseTC, ddy_baseTC;
+    float lodDiffuse = ComputeTextureLOD(baseTC.xy, ResInfoDiffuse.xy, ddx_baseTC, ddy_baseTC);
+    
+    //float lodBump = ComputeTextureLOD(bumpTC.xy, ResInfoBump.xy);
+    float2 ddx_bumpTC, ddy_bumpTC;
+    float lodBump = ComputeTextureLOD(bumpTC.xy, ResInfoBump.xy, ddx_bumpTC, ddy_bumpTC);
+  
+	#if %TEMP_TERRAIN || %DECAL
+	
+   #if %DECAL
+    float dispAmount = pPass.fBumpHeightScale;
+   #else
+   	float dispAmount = pPass.fBumpHeightScale * pPass.IN.Color.g;
+   #endif
+   	
+    float3 viewDir = mul(pPass.mTangentToWS, -pPass.vView);
+   	float2 offsetBest = ParallaxOcclusionMap(bumpTC.xy, lodBump, viewDir, 15, dispAmount);
+
+    baseTC.xy = offsetBest.xy;
+    bumpTC.xy = offsetBest.xy;
+    
+	#else
+	
+    float sceneDepth = DecodeSceneDepth(sceneDepthSampler_POM, pPass.IN.screenProj.xyww);
+    
+    float3 viewDirWS = pPass.IN.vView.xyz;	
+    float scale = sceneDepth - dot(viewDirWS, -CamFrontVector_POM);
+        
+    float3 parallax = mul(pPass.mTangentToWS, pPass.vView).xyz;
+    float2 offset = normalize( parallax.xy / -parallax.z ) * scale * 0.25;
+           
+    baseTC.xy += offset.xy;
+    bumpTC.xy += offset.xy;
+        
+  #endif
+        
+    //pPass.cDiffuseMap = tex2Dlod(diffuseMapSampler, float4(baseTC.xy, 0, lodDiffuse));
+    //pPass.cBumpMap.xyz = GetNormalMapLod(bumpMapSampler, float4(bumpTC.xy, 0, lodBump));    
+    
+	// high quality lookup which works with anisotropic filtering.
+    pPass.cDiffuseMap = tex2Dgrad(diffuseMapSampler, baseTC.xy, ddx_baseTC, ddy_baseTC);
+    pPass.cBumpMap.xyz = GetNormalMapGrad(bumpMapSampler, bumpTC.xy,  ddx_bumpTC.xyxy, ddy_bumpTC.xyxy);
+
+    pPass.IN.baseTC.xy = baseTC.xy;
+    pPass.IN.bumpTC.xy = bumpTC.xy;
+  }
+  else
+  {
+    pPass.cDiffuseMap = tex2D(diffuseMapSampler, baseTC.xy);
+    if (!pPass.bDontUseBump)
+      pPass.cBumpMap = GetNormalMap(bumpMapSampler, bumpTC.xy);                                      // 2 alu 
+    else
+      pPass.cBumpMap = half3(0,0,1);	
+  }
+
+  pPass.vNormalDiffuse = pPass.cBumpMap;
+  if (pPass.bDiffuseBump && !pPass.bDontUseBump)
+    pPass.vNormalDiffuse = tex2D(bumpMapSampler_Diffuse, bumpTC.xy)*2-1;// 3 alu
+
+  if( pPass.bDetailBumpMapping )
+  {
+  	float2 tcDetail = baseTC.xy * pPass.vDetailBumpTilling;  					                             // 1 inst
+    half4 cDetail = tex2D(detailMapSampler, tcDetail ) + tex2D(detailMapSampler, tcDetail *2); 		 // 2 inst + 2 tex
+
+    if( pPass.bDetailBumpMappingMasking )
+    {
+      pPass.fDetailBumpScale *= pPass.cDiffuseMap.w;
+      pPass.fDetailBlendAmount *= pPass.cDiffuseMap.w;
+    }
+    			    			
+    // detail bump
+		pPass.cBumpMap.xy += cDetail.xy * pPass.fDetailBumpScale;			                                 // 1 inst
+		pPass.cBumpMap.xy -= pPass.fDetailBumpScale;																									 // 1 inst
+
+    if (pPass.bDiffuseBump )
+    {
+      //float fLen = length(pPass.vNormalDiffuse.xy);
+      pPass.vNormalDiffuse.xy += cDetail.xy * pPass.fDetailBumpScale;			                                 // 1 inst
+      pPass.vNormalDiffuse.xy -= pPass.fDetailBumpScale;																									 // 1 inst
+      //pPass.vNormalDiffuse.xy = normalize( pPass.vNormalDiffuse.xy ) * fLen;
+    }
+
+    // diffuse detail
+		// pPass.cDiffuseMap.xyz *= lerp(1, cDetail.w, pPass.fDetailBlendAmount);  		 // 3 inst - hlsl makes 5
+    pPass.cDiffuseMap.xyz = lerp(pPass.cDiffuseMap.xyz, pPass.cDiffuseMap.xyz * cDetail.w, pPass.fDetailBlendAmount); // workaround hlsl to make 3 inst
+  }
+
+  // Set default alpha
+  pPass.fAlpha = pPass.cDiffuseMap.w * pPass.IN.Ambient.w;
+
+   // Debug output
+#if %_RT_DEBUG0 || %_RT_DEBUG1 || %_RT_DEBUG2 || %_RT_DEBUG3
+   DebugOutput(cOut, baseTC);
+   return cOut;
+#endif
+            
+  // Get main vectors/coeficients	     
+  pPass.vNormal = mul(pPass.cBumpMap.xyz, pPass.mTangentToWS);                                      // 3 alu
+  if (pPass.bDiffuseBump && !pPass.bDontUseBump)
+    pPass.vNormalDiffuse =  mul(pPass.vNormalDiffuse.xyz, pPass.mTangentToWS);                                      // 3 alu
+
+  if (pPass.bRenormalizeNormal)
+    pPass.vNormal = normalize(pPass.vNormal);                                                       // 3 alu
+ 
+  // Store some constant coeficients
+  pPass.fNdotE = ( dot(pPass.vView.xyz, pPass.vNormal.xyz));                                        // 1 alu
+  if (pPass.nQuality != QUALITY_LOW)
+    pPass.fSpecPow = MatSpecColor.w;	
+#if !%DYN_BRANCHING
+  else
+  if (%_LT_NUM)
+    pPass.fSpecPow = LGetSpecular(0).w;	
+#endif
+  
+  pPass.vReflVec = (2.0 * pPass.fNdotE * pPass.vNormal.xyz) - pPass.vView.xyz;                      // 2 alu  		    
+        
+  // load the environment map
+  if( pPass.nReflectionMapping > 0 )
+  {
+    if( pPass.nReflectionMapping == REFLECT_CUBE)
+    {
+      pPass.cEnvironment = GetEnvironmentCMap(envMapSamplerCUBE, pPass.vReflVec.xyz);    
+    }
+    else
+    if( pPass.nReflectionMapping == REFLECT_SPHERE)
+    {
+      // should be transformed to view space - but adds quite a lot instructions
+      pPass.cEnvironment = GetEnvironment2DMap(envMapSampler, pPass.vReflVec.xy);      
+    }
+    
+
+    pPass.fFresnel = pPass.fFresnel_Bias + GetFresnelTex(pPass.fNdotE, 0).w * pPass.fFresnel_Scale; // 1 alu    
+
+    if( pPass.nQuality <= QUALITY_MEDIUM )
+    {
+      // cheap fresnel for low specs
+      // Get fresnel term (artist friendlier)
+      pPass.cEnvironment *= saturate( pPass.fReflection_Amount );                                                 // 1 alu  			    
+      
+      pPass.fFresnel = 1 - saturate( pPass.fNdotE );
+    }
+    else
+    {
+      // Get fresnel term (artist friendlier)
+      pPass.cEnvironment *= pPass.fReflection_Amount;                                                 // 1 alu  			    
+    }
+
+    // Apply fresnel to environment map
+    pPass.cEnvironment *= pPass.fFresnel;         
+
+  }
+                                                                
+  // do custom pass setup
+  frag_custom_begin(pPass);
+
+  half3 vAmbientNormal = pPass.vNormal.xyz;
+  if (pPass.bDiffuseBump)
+  {
+    vAmbientNormal = pPass.vNormalDiffuse.xyz;
+  }
+
+#if %_LT_LIGHTS
+#if %DYN_BRANCHING
+  float2 tcLI = LightInfoTC_DB.xy;
+  float tcIter = LightInfoTC_DB.z;
+  float tcIterParam = LightInfoTC_DB.w;
+  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)
+#else
+  // Light types
+  const int aLType[4] = {%_LT_0_TYPE, %_LT_1_TYPE, %_LT_2_TYPE, %_LT_3_TYPE};        
+ #ifdef D3D10
+  [unroll]
+ #endif
+  for (int i=0; i<%_LT_NUM; i++)
+#endif
+  {       
+    float4 WorldLightPos;
+#if %DYN_BRANCHING
+    // We can't index constants in cycle, so get light/shadow info from the texture
+    WorldLightPos = tex2Dlod(LightInfoSampler_DB, float4(tcLI, 0, 0));
+    half4 Diffuse = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam, tcLI.y, 0, 0));
+    half4 Specular = Diffuse;
+    Specular.xyz *= Diffuse.w;
+    half4 ShadowChanMask = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam*3, tcLI.y, 0, 0));
+    float nType = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam*2, tcLI.y, 0, 0)).w;
+#else
+    int nType = aLType[i];                              
+    WorldLightPos = LGetPosition(i);
+    half4 Diffuse = LGetDiffuse(i);
+    half4 Specular;
+    if (pPass.nQuality == QUALITY_LOW)
+    {
+      Specular = LGetSpecular(i);
+    }
+    else
+    {
+      Specular = Diffuse;
+      Specular.xyz *= Diffuse.w;
+    }
+    
+    half4 ShadowChanMask = LGetShadowMask(i);    
+
+    // Some optimisations for sun light (per-frame parameters and hardcoded values)    
+    if (nType == LT_DIRECTIONAL)
+    {
+      WorldLightPos = g_PS_SunLightDir;
+      ShadowChanMask = float4(1,0,0,0);
+    }
+#endif
+
+    // make shadowed areas more interesting
+    half fOcclShadow = saturate( 1 - dot(pPass.cShadowOcclMap, ShadowChanMask) + 0.05);         // 1 alu
+    if( pPass.bDisableInShadowShading  )
+      fOcclShadow = saturate( 1 - dot(pPass.cShadowOcclMap, ShadowChanMask));                    // 1 alu
+        
+    half fFallOff = 1;
+    float3 vLight, vLightWS;        
+    if (nType == LT_DIRECTIONAL)
+    {      
+      vLightWS = WorldLightPos.xyz * 10000.0f;
+      vLight = WorldLightPos.xyz;
+    }
+    else
+    {
+      vLightWS = WorldLightPos.xyz - pPass.IN.vView.xyz;      
+      vLight = normalize(vLightWS.xyz);                                                         // 3 alu
+      fFallOff = GetAttenuation(vLightWS.xyz, WorldLightPos.w);                                   // 2 alu
+    }       
+
+    if (pPass.bParallaxOcclusionMapping)
+    {
+      float3 light = mul(pPass.mTangentToWS, vLight.xyz);
+      float2 lightDelta = float2(light.x, light.y) * pPass.fBumpHeightScale;
+      
+      float h0 = tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy).w;
+      float h = h0;
+    
+      h = max(0, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 1.000 * lightDelta).w); 
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.875 * lightDelta).w); 
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.750 * lightDelta).w);
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.625 * lightDelta).w);
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.500 * lightDelta).w);
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.375 * lightDelta).w);
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.250 * lightDelta).w);
+      h = max(h, tex2D(bumpHeightMapSampler, pPass.IN.bumpTC.xy + 0.125 * lightDelta).w);
+        
+      float soften = pPass.fSelfShadowStrength;
+#if %TEMP_TERRAIN
+    	soften *= saturate(pPass.IN.Color.g - 0.9) * 10.0;
+#endif      
+      float shadow = 1 - saturate((h - h0) * soften);
+      
+      fOcclShadow *= shadow;
+    }
+        
+    // Get projector filter color if needed
+    half3 filterColor = 1;
+		#if %_LT_HASPROJ  
+      if (nType == LT_PROJECTED)
+        filterColor = texCUBE(projCubeSampler, pPass.IN.projTC.xyz);
+  	#endif
+    
+    // Compute diffuse
+    half fNdotL = dot(vLight.xyz, pPass.vNormal.xyz);                                                   // 1 alu
+  
+  #if %DYN_BRANCHING               
+    if (fFallOff > 0 && fNdotL > 0) // -> some shading might require wrapped NdotL value
+  #endif                           
+    { 
+      // Initialize light pass structure with per-light shared data
+      fragLightPass pLight = (fragLightPass) 0;
+      
+      pLight.nType = nType;
+                  
+      pLight.cDiffuse = Diffuse;
+      pLight.cSpecular = Specular;
+      if (pPass.nQuality == QUALITY_LOW)
+      {
+#if !%_RT_SPECULAR
+        pLight.cSpecular = 0;
+#endif
+      }
+      
+      pLight.vLight = vLight;
+      
+      pLight.fNdotL = fNdotL;
+      pLight.fOcclShadow = fOcclShadow;
+      
+      pLight.fFallOff = fFallOff;
+      pLight.cFilter = filterColor;
+      
+                                                             
+      // per shader custom shading 
+      frag_custom_per_light(pPass, pLight);
+            
+      cOut.xyz += pLight.cOut.xyz;                                                                  // 1 alu
+    }      
+  }
+#endif
+
+  pPass.cAOMapVal = 1.f;
+
+  // Ambient term
+#if %_RT_AMBIENT
+  half3 amb = pPass.IN.Ambient.xyz;
+
+  if (pPass.nQuality == QUALITY_HIGH)
+  {
+ #if %_RT_RAE_GEOMTERM
+    //amb.xyz	=	RAE_AmbientByPosNormal(PS_WorldViewPos.xyz+pPass.IN.vView.xyz,pPass.vNormalDiffuse); //35alu
+   	half	RamTex	=	tex2D(RAE_ReflectanceMap, pPass.IN.baseTC.wz).y;										// 1 tex
+    amb.xyz	*=	pPass.cBumpMap.z*RamTex;																										// 1 alu
+ #elif %_RT_AMBIENT_OCCLUSION
+    amb.xyz *= GetSkyAmount(fromObjSampler0, fromObjSampler1, pPass.IN.OutdoorAOInfo.xy, 
+    OutdoorAOFragInfo.r, pPass.vNormal, pPass.IN.OutdoorAOInfo.z, OutdoorAOFragInfo.b, OutdoorAOFragInfo.g,
+    pPass.IN.screenProj.xyzw);
+ #else
+    if( pPass.bHemisphereLighting )      
+      amb.xyz = lerp(amb*0.5f, amb, saturate(vAmbientNormal.z*0.5f+0.5f));             // 4 alu  				
+      
+ #endif
+  }
+
+  // custom ambient pass
+  frag_custom_ambient(pPass, amb);
+  
+  //if (!pPass.bDontUseEmissive)
+  //  pPass.cAmbientAcc += MatEmissiveColor.xyz;
+
+#if !%_RT_FOG // Skip alpha blended objects
+  if( pPass.nQuality == QUALITY_HIGH && pPass.bRefractionMap == false) // skip refractive objects
+  {
+    // apply SSAO, TerrainAO and negative fill lights
+    float4 vAO = tex2D( sceneAOTarget, pPass.IN.screenProj.xy / pPass.IN.screenProj.w - float2(g_PS_SunColor.w, g_PS_SkyColor.w) );
+    pPass.cAOMapVal = vAO.x*vAO.y*vAO.w;
+    pPass.cAmbientAcc.xyz *= pPass.cAOMapVal;    
+    
+//---------------------------------------------------------------------
+//-------------------- View dependent ambient ----------------------------
+
+      half fInput = max(pPass.fNdotE, 0.001);
+      pPass.cAmbientAcc.xyz *= fInput * 0.25 + 0.75;
+      half fSpecular = 0.025 * pow( fInput, pPass.fSpecPow );		//pow
+      pPass.cSpecularAcc.xyz += fSpecular * pPass.cAmbientAcc.xyz;		//mad 
+
+//---------------------------------------------------------------------
+//---------------------------------------------------------------------
+    
+    pPass.cAmbientAcc.xyz += ((1.f-vAO.z)*8.f); // positive fill lights
+  }
+#endif
+  
+
+#endif  // _RT_AMBIENT
+
+  if( pPass.bCustomComposition == false )
+  {
+    frag_final_composition( pPass, cOut.xyz );
+  }
+  
+  frag_custom_end(pPass, cOut.xyz);
+  
+  if (pPass.bVertexColors)
+  {
+    cOut.xyz *= pPass.IN.Color.xyz;
+  }
+  
+#if %_RT_AMBIENT
+
+  if (pPass.bAlphaGlow)
+  {
+    cOut.xyz += pPass.cDiffuseMap.w * pPass.cDiffuseMap.xyz * pPass.fAlphaGlow_Multiplier;
+  }
+
+#endif
+
+  // distance blend out
+  cOut.w = pPass.fAlpha;
+
+  // Setup final fog
+  frag_fog_setup( pPass, cOut);
+       
+  return cOut;
+}
+
+//============================================================================================
+

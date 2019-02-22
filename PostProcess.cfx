@@ -1,0 +1,1430 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Shader Source File
+//  Copyright (C), Crytek Studios, 2001-2007
+// -------------------------------------------------------------------------
+//  File name:   PostProcess.cfx
+//  Version:     v1.00
+// -------------------------------------------------------------------------
+//  History:
+//
+//  02/2019  -  Smoother Luminance and some optimizations
+//              by Sbilikiewicz https://github.com/sbilikiewicz
+//
+////////////////////////////////////////////////////////////////////////////
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "ModificatorVT.cfi"
+
+// HDRSampleLumInitialPS(9 Samples) -> HDRSampleLumIterativePS(4linear/16point samples) -> HDRSampleLumFinalPS(4linear/16point samples)
+
+#define USE_EXP_TONEMAPPING
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = HDR;"
+>;
+
+/// Un-Tweakables
+float4 ScreenSize  : PB_ScreenSize;
+
+float4x4 UnProjMatrix : PB_UnProjMatrix;
+
+float4 SampleOffsets[16] < register = c0; >
+float4 SampleWeights[16] < register = c16; >
+float4x4 HDRColorMatrix;
+
+float4 HDRParams0;	// (r_hdreyeadaptationfactor,r_hdrbrightoffset,r_hdrbrightthreshold,r_HDRLevel)
+float4 HDRParams1;	// (r_hdreyeadaptationbase,*,*,r_EyeAdaptationClamp)
+float4 HDRGamma;	// (m_LumGamma.LowPercentil,m_LumGamma.MidPercentil,m_LumGamma.HighPercentil,m_LumGamma.Bias)
+
+#define PROFILE_PS ps_2_0
+#define PROFILE_VS vs_2_0
+
+float ElapsedTime;
+float4 FrameRand;
+float Time = {PB_time};
+
+float g_fBloomScale = 2.5f;
+
+sampler2D zMap : register(s0);
+sampler2D sceneMap0 : register(s0);
+sampler2D sceneMap1 : register(s1);
+sampler2D sceneMap2 : register(s2);
+sampler2D sceneMap3 : register(s3);
+sampler2D sceneMap4 : register(s4);
+sampler2D sceneMap5 : register(s5);
+sampler2D sceneMap6 : register(s6);
+sampler2D sceneMap7 : register(s7);
+sampler2D noiseMap : register(s4);
+
+sampler2D baseMap : register(s0);
+sampler2D baseMaps[8] : register(s0);
+sampler2D bloomMap : register(s1);
+sampler2D adaptedLumMap3 : register(s3);
+sampler2D adaptedLumMap4 : register(s4);
+
+sampler2D baseMapRG : register(s0);
+sampler2D baseMapBA : register(s1);
+sampler2D lumMap    : register(s2);
+
+sampler2D lumMap0    : register(s0);
+sampler2D lumMap1    : register(s1);
+
+
+struct app2vert
+{
+  IN_P
+  IN_TBASE
+  IN_C0
+};
+
+struct app2vertFog
+{
+  IN_P
+  IN_TBASE
+  float3 CamVec    : TEXCOORD1;  
+};
+
+struct vert2frag
+{
+  float4 HPosition  : POSITION;
+  float2 baseTC     : TEXCOORD0;
+  float2 baseTCRnd  : TEXCOORD1;
+};
+
+struct vert2fragFog
+{
+  float4 HPosition  : POSITION; 
+  float2 baseTC       : TEXCOORD0;
+  float3 CamVec       : TEXCOORD1;  
+};
+
+struct pixout_MRT
+{
+  float4 Color  : COLOR0;
+#ifdef %SEPARATE_FP16
+  float4 Color1 : COLOR1;
+#endif  
+};
+
+// RangeReducedAdaptedLum
+half EyeAdaption( half fSceneLuminance )
+{
+#ifdef USE_EXP_TONEMAPPING
+	half ret = lerp(HDRParams1.x,fSceneLuminance,HDRParams0.x);	// good values: r_hdreyeadaptationbase=0.25, r_hdreyeadaptationfactor=0.5
+#else
+	// reinhard white-point
+	half ret = lerp(HDRParams1.x,fSceneLuminance,HDRParams0.x); // good values: r_hdreyeadaptationbase=0.2, r_hdreyeadaptationfactor=0.35
+#endif	
+	
+//	ret =max(ret,0.2f);
+	return ret;
+}
+
+// Note: DirectX will skip the vshader for vformats containing a transformed
+// position (VERTEX_FORMAT_TRP3F_*). The PreTransformedVS shader is executed
+// only for platforms that do not support pre-transformed verts (e.g. OpenGL).
+vert2frag PreTransformedVS(app2vert IN)
+{
+  vert2frag OUT = (vert2frag)0; 
+
+	// Position in pixel coordinates (i.e. 0 thru ScreenSize - 1).
+  float4 vPos = IN.Position;
+  OUT.HPosition = float4(
+			2.0f * (vPos.xy + 0.5f) / ScreenSize.xy - 1.0f, vPos.zw);
+  OUT.baseTC.xy = IN.baseTC.xy;
+
+  return OUT;
+}
+
+vert2frag TransformedVS(app2vert IN)
+{
+  vert2frag OUT = (vert2frag)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.HPosition = vPos;
+  
+  float2 baseTC = vPos.xy * float2(0.5, -0.5) + 0.5;
+#if !D3D10  
+  OUT.HPosition.xy += float2(-0.5, 0.5) * g_VS_ScreenSize.zw;
+#endif
+  
+  OUT.baseTC.xy = baseTC;    
+  OUT.baseTCRnd.xy = (baseTC / 64.0) * g_VS_ScreenSize.xy + FrameRand.xy;
+  
+  return OUT;
+}
+
+vert2fragFog PreTransformedFogVS(app2vertFog IN)
+{
+	vert2fragFog OUT = (vert2fragFog)0;
+
+	// Position in pixel coordinates (i.e. 0 thru ScreenSize - 1).
+  float4 vPos = IN.Position;
+  OUT.HPosition = float4(
+			2.0f * (vPos.xy + 0.5f) / g_VS_ScreenSize.xy - 1.0f, vPos.zw);
+  OUT.baseTC.xy = IN.baseTC.xy;
+	OUT.CamVec.xyz = IN.CamVec.xyz;
+
+	return OUT;
+}
+
+
+vert2fragFog TransformedFogVS(app2vertFog IN)
+{
+  vert2fragFog OUT = (vert2fragFog)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.HPosition = vPos;
+  
+  OUT.baseTC.xy = IN.baseTC.xy;
+  OUT.CamVec.xyz = IN.CamVec.xyz;
+
+  return OUT;
+}
+
+vert2frag TransformVS(app2vert IN)
+{
+  vert2frag OUT = (vert2frag)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.HPosition = mul(vpMatrix, vPos);
+  
+  OUT.baseTC.xy = IN.baseTC.xy;
+
+  return OUT;
+}
+
+pixout HDRBloomPS(vert2frag IN)
+{
+  pixout OUT;
+
+  half4 vSample = 0.0f;
+  half4 vColor = 0.0f;
+      
+  half2 vSamplePosition;
+  
+  // Perform a one-directional gaussian blur
+  int nIterN = 15;
+#if %BILINEAR_FP16
+  nIterN = 8;
+#endif    
+  for(int i=0; i<nIterN; i++)
+  {
+    vSamplePosition = IN.baseTC.xy + SampleOffsets[i].xy;
+    vColor = tex2D(baseMap, vSamplePosition);
+    vSample += SampleWeights[i] * vColor;
+  }
+    
+  OUT.Color = vSample;
+
+  return OUT;
+}
+
+pixout HDRBrightPassFilterPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 vSample;
+#ifndef %SEPARATE_FP16
+  vSample = tex2D(baseMap, IN.baseTC.xy);
+#else
+  vSample.xy = tex2D(baseMapRG, IN.baseTC.xy).xy;
+  vSample.zw = tex2D(baseMapBA, IN.baseTC.xy).xy;
+#endif
+
+	// this way we check for NAN (illegal floats) as HLSL optimized the isnan() away
+	// visible mostly on NVIDIA, if possible this should be removed and no shader should produce NAN
+	  vSample.rgb = (vSample.rgb> 10000.0f)? half3(1, 1, 1): vSample.rgb;
+
+    // Sbilikiewicz try to use abs() to get more stability
+	//if(abs(dot(vSample, 0.333)) > 10000.0f) vSample =1.0f;
+
+		
+
+#if !%_RT_HDR_HISTOGRAMM
+
+#ifndef %SEPARATE_FP16
+  half fAdaptedLum = tex2D(lumMap1, float2(0.5f, 0.5f)).x;
+#else
+  half fAdaptedLum = tex2D(lumMap, float2(0.5f, 0.5f)).x;
+#endif
+
+
+  half Level = HDRParams0.w;
+  half BrightOffset = HDRParams0.y;
+  half BrightThreshold = HDRParams0.z;
+  
+	half fAdaptedLumDest = EyeAdaption(fAdaptedLum);		// RangeReducedAdaptedLum
+	  
+  // Determine what the pixel's value will be after tone-mapping occurs
+   vSample.rgb *= Level/(fAdaptedLumDest + 0.015);
+  
+  // Subtract out dark pixels
+  vSample.rgb -= BrightThreshold;
+  
+  //Clamp to 0 
+   vSample = max(vSample, (half4)0.0);
+  
+  // Map the resulting value into the 0 to 1 range. Higher values for
+  // BRIGHT_PASS_OFFSET will isolate lights from illuminated scene 
+  // objects.
+   vSample.rgb /= (BrightOffset+vSample.rgb);
+
+#else
+
+  half Level = HDRParams0.w;
+
+  vSample.rgb *= Level/(HDRParams0.z + 0.001);
+
+#endif
+
+  // We add lightshafts only on brightpass since it looks better/smoother than adding directly to HDRScene
+   
+  // will need encode/decode if quality < med
+  half4 cLightShafts = ( tex2D(sceneMap2, IN.baseTC.xy) );
+  
+  // Use rgbs if fp16 filtering not supported
+  #if !%BILINEAR_FP16  
+    cLightShafts.xyz = DecodeRGBS( cLightShafts );  
+  #endif     
+       
+  OUT.Color = vSample + cLightShafts / g_fBloomScale;
+  
+//  OUT.Color = float4(1,0.1,0.1,0);
+
+  return OUT;
+}
+
+pixout HDRCalculateAdaptedLumPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half fAdaptedLum = tex2D(lumMap0, float2(0.5f, 0.5f)).x;
+  half fCurrentLum = tex2D(lumMap1, float2(0.5f, 0.5f)).x;
+
+#ifdef OPENGL
+	if(isnan(fCurrentLum))
+		fCurrentLum = 1.0f;
+	if(isnan(fAdaptedLum))
+		fAdaptedLum = 1.0f;
+#else
+	// this way we check for NAN (illegal floats) as HLSL optimized the isnan() away
+	if(abs(fCurrentLum)>10000.0f)
+		fCurrentLum=1.0f;
+	if(abs(fAdaptedLum)>10000.0f)
+		fAdaptedLum=1.0f;
+#endif
+ 
+  // The user's adapted luminance level is simulated by closing the gap between
+  // adapted luminance and current luminance by 2% every frame, based on a
+  // 30 fps rate. This is not an accurate model of human adaptation, which can
+  // take longer than half an hour.
+  //half fNewAdaptation = fAdaptedLum + (fCurrentLum - fAdaptedLum) * ( 1 - pow( 0.98f, 30 * ElapsedTime));
+  
+  half fNewAdaptation = fAdaptedLum + (fCurrentLum - fAdaptedLum) * ( 1 - pow( 0.98f, 1.2 * ElapsedTime));
+		
+  OUT.Color = float4(fNewAdaptation, fNewAdaptation, fNewAdaptation, 1.0f);
+
+  return OUT;
+}
+
+pixout HDRCutPercentileInitialPS(vert2frag IN)
+{
+  pixout OUT;
+
+  const half PERCENTILTRESHOLD	=	0.95f;
+
+  
+  half3 vSample = 0.0f;
+  half  fLogLumSum = 0.0f;
+  int iSampleCount=9;
+  half3 LUMINANCE_VECTOR  = half3 (0.2125f, 0.7154f, 0.0721f);
+	half CurrentLum = 1.f/tex2D(sceneMap2,half2(0.f,0.f)).x;
+
+  for(int i=0; i<iSampleCount; i++)
+  {
+
+#if %SEPARATE_FP16
+    vSample.xy = tex2D(baseMapRG, IN.baseTC.xy+SampleOffsets[i].xy).xy;
+    vSample.z = tex2D(baseMapBA, IN.baseTC.xy+SampleOffsets[i].xy).x;
+#else
+    vSample = tex2D(baseMap, IN.baseTC.xy+SampleOffsets[i].xy).xyz;
+#endif
+    fLogLumSum += ( dot(vSample, LUMINANCE_VECTOR)*CurrentLum>PERCENTILTRESHOLD);
+//		fLogLumSum	=	max(dot(vSample, LUMINANCE_VECTOR),fLogLumSum);
+  } 
+
+
+  OUT.Color = (fLogLumSum/(float)iSampleCount);
+//  OUT.Color = fLogLumSum;
+
+  return OUT;
+}
+
+pixout HDRCutPercentileIterativePS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half fResampleSum = 0.0f; 
+  
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    // Compute the sum of luminance throughout the sample points
+    half4 vTex = tex2D(baseMap, IN.baseTC.xy+SampleOffsets[i].xy);
+		fResampleSum += vTex.x;
+//		fResampleSum = max(vTex.x,fResampleSum);
+  }
+  OUT.Color = fResampleSum/(float)nIter;
+//  OUT.Color = fResampleSum;
+  
+  return OUT;
+}
+
+pixout HDRCutPercentileFinalPS(vert2frag IN)
+{
+  pixout OUT;
+
+  const half PERCENTILTRESHOLD	=	0.95f;
+  
+  half fResampleSum = 0.0f;
+  
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    // Compute the sum of luminance throughout the sample points
+    half4 vTex = tex2D(baseMap, IN.baseTC.xy+SampleOffsets[i].xy);
+		fResampleSum += vTex.x;
+//		fResampleSum = max(vTex.x,fResampleSum);
+  }
+  OUT.Color = float4(fResampleSum/PERCENTILTRESHOLD,0,0,0);  //*2 to map it to 0.5f
+//  OUT.Color = fResampleSum;
+  
+  return OUT;
+}
+
+
+pixout HDRSampleLumInitialPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half vSample = 0.0f;
+  half fLogLumSum = 0.0f;
+  int iSampleCount=9;
+//  half3 LUMINANCE_VECTOR = half3 (0.2125f, 0.7154f, 0.0721f) / (float)iSampleCount;
+  half MAX_LUM = 64.0 / (float)iSampleCount;
+
+   // Compute the sum of log(luminance) throughout the sample points
+  for(int i=0; i<iSampleCount; i++)
+  {
+	  float2 vTex = IN.baseTC.xy+SampleOffsets[i].xy;
+    half3 cTex;
+
+#if %SEPARATE_FP16
+    cTex.xy = half3( tex2D(baseMapRG,vTex).xy, tex2D(baseMapBA,vTex).x );
+#else
+		cTex = tex2D(baseMap, IN.baseTC.xy+SampleOffsets[i].xy).rgb;
+#endif
+
+		half fLum = dot(cTex.rgb, half3(0.2125f, 0.7154f, 0.0721f)) ;	// * 0.25f;		// 0.5f range adjustment to debug in r_hdrdebug 
+
+	  half fSceneDepth = tex2D(sceneMap3,vTex).r;
+	  
+	  half r_EyeAdaptationClamp = HDRParams1.a;
+	  half fMaxPixelLum = r_EyeAdaptationClamp + saturate(fSceneDepth*10.0f-9.0);	// sky: max is 1, non sky: max is r_EyeAdaptationClamp
+		
+    vSample = min(fLum,fMaxPixelLum);		// clamped (on a high value) to avoid adaption to very bright objects in outdoor (snow field, beach)
+//   vSample = fMaxPixelLum;						// vizualize clamp value - for debugging
+
+    fLogLumSum += vSample;
+  } 
+
+	//This changes save 8instructions (54 to 46)
+//  OUT.Color = fLogLumSum;
+  OUT.Color = min(fLogLumSum/(float)iSampleCount,64);
+
+  return OUT;
+}
+pixout HDRSampleLumIterativePS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half fResampleSum = 0.0f; 
+  
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    // Compute the sum of luminance throughout the sample points
+    half4 vTex = tex2D(baseMap, IN.baseTC.xy+SampleOffsets[i].xy);
+    fResampleSum += vTex.x;
+  }
+  
+  // Divide the sum to complete the average
+  fResampleSum /= (float)nIter;
+
+  OUT.Color = float4(fResampleSum, fResampleSum, fResampleSum, 1.0f);
+  
+  return OUT;
+}
+
+pixout HDRSampleLumFinalPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half fResampleSum = 0.25f;
+  
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    // Compute the sum of luminance throughout the sample points
+    half4 vTex = tex2D(baseMap, IN.baseTC.xy+SampleOffsets[i].xy);
+    fResampleSum += vTex.x;
+  }
+  
+  // Divide the sum to complete the average
+  fResampleSum = fResampleSum/(float)nIter;
+
+  OUT.Color = float4(fResampleSum, fResampleSum, fResampleSum, 1.0f);
+  
+  return OUT;
+}
+
+pixout HDRDownscale2x2PS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 sample = 0.0f;
+
+  int nIter = 4;
+#if %BILINEAR_FP16
+  nIter = 1;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    sample += tex2D(baseMap, IN.baseTC.xy + SampleOffsets[i].xy);
+  }
+    
+  OUT.Color = sample / (float)nIter;
+  
+  return OUT;
+}
+
+pixout HDRDownscale4x4MRTPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 sample = 0.0f;
+
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    float2 tc = IN.baseTC.xy + SampleOffsets[i].xy;
+    sample += tex2D(sceneMap0, tc);
+  }
+    
+#ifdef %SEPARATE_FP16
+  half4 Col = sample / (float)nIter;
+ #ifndef %_RT_SAMPLE1
+  OUT.Color = float4 (Col.xy, 0, 0);
+ #else  
+  OUT.Color = float4 (Col.zw, 0, 0);
+ #endif
+#else  
+  OUT.Color = sample / (float)nIter;
+#endif  
+  return OUT;
+}
+
+pixout HDRDownscale4x4MRTSafePS(vert2frag IN)
+{
+  pixout OUT;
+  
+  float4 sample = 0.0f;
+
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    float2 tc = IN.baseTC.xy + SampleOffsets[i].xy;
+    float4 Color = tex2D(sceneMap0, tc);        
+     
+#ifdef OPENGL
+    if (isnan(Color.x))
+      Color.x = 0.5;
+    if (isnan(Color.y))
+      Color.y = 0.5;
+    if (isnan(Color.z))
+      Color.z = 0.5;
+#endif
+      
+    sample += Color;
+  }
+  
+  sample /= (float)nIter;
+  {
+ 	  sample = max((float4)0.0f,sample);
+   	  
+#ifdef OPENGL
+			if (isnan(sample.x) || isnan(sample.y) || isnan(sample.z))
+				sample = 100.0;
+#else
+ 		if (sample.x+sample.y+sample.z>300)		// this way we check for NAN (illegal floats) as HLSL optimized the isnan() away // regarding to nvidia, any number + NAN == NAN, this saves 6instructions
+		  sample = 100.0;
+#endif
+		  
+	  // 16 tex, 33 arithmetic
+		// 16 tex, 46 arithmetic with if (abs(sample.x)>100 || abs(sample.y)>100 || abs(sample.z)>100)sample = 1.0;
+		// 16 tex, 44 arithmetic with float4 i=abs(sample);if (i.x>100 || i.y>100 || i.z>100) sample = 1.0;
+		// todo: use interpolators
+	}
+
+#ifdef %SEPARATE_FP16
+ #ifndef %_RT_SAMPLE1
+  OUT.Color = float4 (sample.xy, 0, 0);
+ #else  
+  OUT.Color = float4 (sample.zw, 0, 0);
+ #endif
+#else  
+  OUT.Color = sample;
+#endif  
+  return OUT;
+}
+
+pixout HDRDownscale4x4PS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 sample = 0.0f;
+
+  int nIter = 16;
+#if %BILINEAR_FP16
+  nIter = 4;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    float2 tc = IN.baseTC.xy + SampleOffsets[i].xy;
+    sample.xyz += tex2D(sceneMap0, tc).xyz;
+  }
+      
+  OUT.Color = sample / (float)nIter;
+  
+  return OUT;
+}
+
+pixout HDRGaussBlur5x5PS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 vSample = 0.0f;
+
+  int nIter = 13;
+#if %BILINEAR_FP16
+  nIter = 9;
+#endif    
+  for(int i=0; i<nIter; i++)
+  {
+    half4 vTex = tex2D(baseMap, IN.baseTC.xy + SampleOffsets[i].xy);
+    vSample += SampleWeights[i] * vTex;
+  }
+
+  OUT.Color = vSample;
+  
+  return OUT;
+}
+
+pixout HDRMergeTexturesPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 vColor = 0.0f;
+  
+  int nIter = 0;
+#if !%_RT_SAMPLE1 && !%_RT_SAMPLE2 && !%_RT_SAMPLE3
+  nIter = 1;
+#elif %_RT_SAMPLE1 && !%_RT_SAMPLE2 && !%_RT_SAMPLE3
+  nIter = 2;
+#elif !%_RT_SAMPLE1 && %_RT_SAMPLE2 && !%_RT_SAMPLE3
+  nIter = 3;
+#elif %_RT_SAMPLE1 && %_RT_SAMPLE2 && !%_RT_SAMPLE3
+  nIter = 4;
+#elif !%_RT_SAMPLE1 && !%_RT_SAMPLE2 && %_RT_SAMPLE3
+  nIter = 5;
+#elif %_RT_SAMPLE1 && !%_RT_SAMPLE2 && %_RT_SAMPLE3
+  nIter = 6;
+#elif !%_RT_SAMPLE1 && %_RT_SAMPLE2 && %_RT_SAMPLE3
+  nIter = 7;
+#else
+  nIter = 8;
+#endif  
+#if D3D10
+  [unroll]
+#endif
+  for(int i=0; i<nIter; i++)
+  {
+    vColor += SampleWeights[i] * tex2D(baseMaps[i], IN.baseTC.xy);
+  }
+    
+  OUT.Color = vColor;
+  
+  return OUT;
+}
+
+pixout HDRFinalScenePS(vert2frag IN)
+{
+  pixout OUT;
+  
+  // The per-color weighting to be used for luminance calculations in RGB order.
+  half3 LUMINANCE_VECTOR  = float3 (0.2125f, 0.7154f, 0.0721f);
+
+  half4 vSample = tex2D(baseMap, IN.baseTC.xy);
+  
+  half4 vScene = vSample;
+  half4 cBloom = tex2D(bloomMap, IN.baseTC.xy);
+  
+#ifndef %SEPARATE_FP16
+  half fAdaptedLum = tex2D(lumMap, float2(0.5f, 0.5f)).x;
+#else  
+  half fAdaptedLum = tex2D(lumMap, float2(0.5f, 0.5f)).x;
+#endif
+  
+  half Level = HDRParams0.w;
+  half BloomScale = g_fBloomScale;
+
+
+// float2 inTex = IN.baseTC.xy - 0.5;
+//  float vignette  = 1 - dot(inTex, inTex);
+//  vSample.rgb    *= saturate(pow(vignette, 3.5)+0.1);
+
+#ifndef USE_EXP_TONEMAPPING
+
+#if %_RT_HDR_HISTOGRAMM
+  {
+	// Ward94 tone mapping
+	vSample.rgb *= 1/(HDRGamma.z + 0.001);  
+	  
+	// adjust gamma by the MidPercentil
+	float fMidVal = (HDRGamma.y-HDRGamma.x)/(HDRGamma.z-HDRGamma.x);
+	float fGamma = log(0.5f)/log(fMidVal);
+	vSample.rgb = pow(vSample.rgb,fGamma);
+  }
+#else  
+
+  // Reinhard with White Point
+  {
+  
+	  {
+			// todo: combine fTargetAvgLum into fAdaptedLumDest
+  		const half fWhitePoint = 1.2;
+			const half fTargetAvgLum = 0.22f;
+	  
+			const half fInvWhitePoint2 = 1.0f/(fWhitePoint*fWhitePoint);  
+
+			half fAdaptedLumDest = EyeAdaption(fAdaptedLum);		// RangeReducedAdaptedLum
+	  
+			half fLum = dot(half4(vSample.rgb,1),half4(LUMINANCE_VECTOR,0.000001f));		// add small value to avoid division by 0
+			
+	//test glow before tonemapping:			float fLumGlow = dot(float4(tex2D(sceneMap7,IN.baseTC.xy).rgb,1),float4(LUMINANCE_VECTOR,0.000001f));		// add small value to avoid division by 0
+
+			half3 cBlackColor = float3(0.0f,0.0f,0.0f);
+			half fBlackLevel=0;
+			
+	//test glow before tonemapping:		  vSample.rgb = lerp((tex2D(noiseMap,IN.baseTCRnd.xy).xyz) * fLum * float3(0.8f,0.8f,1.4f)*2.0f+cBlackColor, vSample.rgb, saturate(5.0f*(fLum+fLumGlow)));
+		  
+		  vSample.rgb = lerp((0.5+0.5*tex2D(noiseMap,IN.baseTCRnd.xy).xyz) * (fLum+fBlackLevel) * half3(0.8f,0.8f,1.4f)*2.0f, vSample.rgb, saturate(5.0f*fLum));
+
+			half Ls = fTargetAvgLum * fLum / fAdaptedLumDest;
+			half Ld = Ls * (1+Ls*fInvWhitePoint2) / (1+Ls);
+	  	
+			vSample.rgb *= Ld/fLum;
+		}
+
+	  // desaturate
+	  half fSaturation=0.8f;			// 1.0=full saturation, 0.0=grayscale
+  	half fFinalLum = dot(vSample.rgb, LUMINANCE_VECTOR); 	
+	 	vSample.rgb = lerp((half3)fFinalLum, vSample.rgb, fSaturation); 
+	
+		// contrast enhance
+ 		half fInvContrast = 1.15;		// 2.0 = contrast enhanced, 1.0=normal contrast, 0.01= max contrast reduced
+		vSample.rgb = (vSample.rgb-0.5f)*fInvContrast+0.5f;	
+
+	}
+#endif
+
+#endif
+                  
+  // Use rgbs if fp16 filtering not supported
+  #if !%BILINEAR_FP16  
+    cBloom.xyz = DecodeRGBS( cBloom ) * 3.0;  
+  #endif     
+  
+  vSample.xyz += cBloom * BloomScale;       
+  
+#ifdef USE_EXP_TONEMAPPING
+	// custom exp tone mapper
+	{		
+//------------
+		//same, but optimized version, saves 1 instruction
+		half fLum = dot(vSample.rgb, LUMINANCE_VECTOR);
+		half f = EyeAdaption( fAdaptedLum );
+
+		//martin's modified blue shift
+	  vSample.rgb = lerp((fLum * float3(0.8f,0.8f,1.4f)) + tex2D(noiseMap,IN.baseTCRnd.xy).xyz * fLum * float3(0.8f,0.8f,1.4f), vSample.rgb, saturate(5.0f*fLum));
+
+//------------
+
+		// tone mapping
+		half fAdaptedLumDest = 3 / ( max( 0.1, 1 + 10 * EyeAdaption( fAdaptedLum ) ) );
+	  
+//		vSample.xyz = 1 - exp( -fAdaptedLumDest * pow( vSample.xyz, 1.15 ) ); // better contrast but slower
+		vSample.xyz = 1 - exp( -fAdaptedLumDest * vSample.xyz ); 
+	}
+#endif
+
+  // Apply color transformation matrix to ajust saturation/brightness/constrast  
+  half4 tmpSample = half4(vSample.rgb, 1);
+  
+  // do a dp4 instead, saves 3 adds  
+  vSample.rgb = half3(	dot(tmpSample, HDRColorMatrix[0]), dot(tmpSample, HDRColorMatrix[1]), dot(tmpSample, HDRColorMatrix[2]) );
+  
+  OUT.Color = vSample;
+ 
+  return OUT;
+}
+
+pixout HDRFinalDebugScenePS(vert2frag IN)
+{
+  pixout OUT;
+  
+  // The per-color weighting to be used for luminance calculations in RGB order.
+  half3 LUMINANCE_VECTOR  = half3 (0.2125f, 0.7154f, 0.0721f);
+
+  float4 sample = 0;
+  for(int i=0; i<4; i++)
+  {
+    sample += tex2D(baseMap, IN.baseTC.xy + SampleOffsets[i].xy);
+  }
+  float4 vSample = tex2D(baseMap, IN.baseTC.xy);
+  sample += vSample;
+  
+  //float fVal = dot(sample.xyz, half3(1,1,1));
+  
+  float4 s = 1;
+  s.xyz = dot(vSample.xyz, LUMINANCE_VECTOR);
+#ifdef OPENGL
+	if (isnan(sample.x) || isnan(sample.y) || isnan(sample.z) || isnan(sample.w))
+		s = half4(1, 0, 0, 0);
+#else
+//  if (isnan(sample.x))
+//  if (!(sample.x>0 && sample.x<20000.0f))
+  if (sample.x>10000 || sample.y>10000 || sample.z>10000)
+		s = half4(1,0,0,0);
+#endif
+
+  if (sample.x<0 || sample.y<0 || sample.z<0)
+		s=float4(0,1,0,1);
+
+  OUT.Color = s;
+  
+  return OUT;
+}
+		
+void FogPassCommon (in vert2fragFog IN, out half sceneDepth, out half4 localFogColor, out half3 worldPos, out half3 cameraToWorldPos)
+{
+  half2 sDepthRG;
+  sDepthRG = tex2D(zMap, IN.baseTC.xy).rg;   
+  sceneDepth = sDepthRG.x;   
+
+  cameraToWorldPos = sceneDepth * IN.CamVec.xyz;
+  worldPos = cameraToWorldPos + vfViewPos.xyz;
+      
+  localFogColor = GetVolumetricFogColor(worldPos, cameraToWorldPos, sceneDepth);
+#if %_RT_FSAA
+  localFogColor.a = sDepthRG.y;
+#endif
+}
+
+pixout FogPassPS(vert2fragFog IN)
+{
+  pixout OUT;
+
+#if %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3
+    OUT.Color = NumInstructions;
+    return OUT;
+#endif
+
+	half sceneDepth;
+	half4 localFogColor;
+	half3 worldPos, cameraToWorldPos;
+	
+	FogPassCommon(IN, sceneDepth, localFogColor, worldPos, cameraToWorldPos);
+	
+	localFogColor.a = 1.0 - localFogColor.a;
+  
+  HDROutput(OUT, localFogColor, 1);
+  
+  return OUT;
+}
+
+float4 LightningPos;				
+float4 LightningColSize;
+				
+pixout FogPassWithLightningPS(vert2fragFog IN)
+{
+  pixout OUT;
+
+#if %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3
+    OUT.Color = NumInstructions;
+    return OUT;
+#endif
+
+	half sceneDepth;
+	//half4 localFogColor;
+	half3 worldPos, cameraToWorldPos;
+	
+	//FogPassCommon(IN, sceneDepth, localFogColor, worldPos, cameraToWorldPos);
+	
+  half2 sDepthRG = tex2D(zMap, IN.baseTC.xy).rg;
+  sceneDepth = sDepthRG.x;   
+
+  cameraToWorldPos = sceneDepth * IN.CamVec.xyz;
+  worldPos = cameraToWorldPos + vfViewPos.xyz;
+	
+
+	/////////////////////////////////////////////////////////////
+	// lightning computation... 
+	// TODO: Optimize to fit into ps_2_0 limits!
+	
+	float atten = LightningColSize.w;	
+	float3 c = atten * ( LightningPos.xyz - vfViewPos.xyz );
+	float3 d = atten * cameraToWorldPos;
+		
+	float u = dot( c, c ) + 1;
+	float v = -2 * dot( c, d );
+	float w =  dot( d, d );
+	float div = rsqrt( 4 * u * w - v * v );	
+	//float lightning = sqrt( w ) * 2 * ( atan( ( v + 2 * w ) * div ) - atan( v * div ) ) * div; 
+	float2 atan_res = atan( float2( v + 2 * w, v ) * div );
+	float lightning = sqrt( w ) * 2 * ( atan_res.x - atan_res.y ) * div; 
+    
+  /////////////////////////////////////////////////////////////
+	
+  half4 Color = half4(LightningColSize.xyz * lightning, 1);
+  
+  HDROutput(OUT, Color, 1);
+  
+  return OUT;
+}
+
+pixout EncodeHDRPS(vert2frag IN)
+{
+  pixout OUT;
+	  
+  half4 sceneColor = tex2D(sceneMap0, IN.baseTC.xy);
+  OUT.Color = HDREncode_ToLDR_RGBK(sceneColor);
+
+  return OUT;
+}
+
+pixout Downscale4x4PS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 sample = 0.0f;
+
+  int nIter = 16;
+  for(int i=0; i<nIter; i++)
+  {
+    float2 tc = IN.baseTC.xy + SampleOffsets[i].xy;
+    sample.xyz += tex2D(sceneMap0, tc).xyz;
+  }
+      
+  OUT.Color = sample / (float)nIter;
+  
+  return OUT;
+}
+
+pixout Downscale4x4_ToLDRPS(vert2frag IN)
+{
+  pixout OUT;
+  
+  half4 sample = 0.0f;
+
+  int nIter = 16;
+  for(int i=0; i<nIter; i++)
+  {
+    float2 tc = IN.baseTC.xy + SampleOffsets[i].xy;
+    sample.xyz += tex2D(sceneMap0, tc).xyz;
+  }
+      
+  OUT.Color = HDREncode_ToLDR_RGBK(sample / (float)nIter);
+  
+  return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// ComposeFinalHDRGlow: compose final HDR glow into LDR glow texture //////////////////////////////
+
+/// Specific data ////////////////////////
+
+/// Constants ////////////////////////////
+
+struct vtxIn
+{
+  IN_P
+  IN_TBASE
+};
+
+struct vtxOut
+{
+  float4 HPosition  : POSITION;
+  float4 baseTC     : TEXCOORD0;
+};
+
+///////////////// vertex shader //////////////////
+
+vtxOut BaseVS(vtxIn IN)
+{
+  vtxOut OUT = (vtxOut)0; 
+
+  float4 vPos = IN.Position;
+  OUT.HPosition = mul(vpMatrix, vPos);  
+  OUT.baseTC.xy = IN.baseTC.xy;
+
+  return OUT;
+}
+
+////////////////// samplers /////////////////////
+
+half4 EncodeHDRGlowMaps( half4 rt0, half4 rt1, half4 rt2 )
+{
+  rt0.xyz = DecodeRGBS( rt0 );
+  rt1.xyz = DecodeRGBS( rt1 );
+  rt2.xyz = DecodeRGBS( rt2 );
+  
+  // 2.0, 1.15, 0.45 - handtweaked values to get nice sharp falloff
+  half4 cSum = ( rt0 * 2.0 + rt1 * 1.15 + rt2 * 0.45) / 3.0;
+  
+  return EncodeRGBS( cSum );
+}
+
+pixout ComposeFinalHDRGlowPS(vtxOut IN)
+{
+  pixout OUT;
+  
+  half4 map0 = tex2D( sceneMap0, IN.baseTC.xy);    
+  half4 map1 = tex2D( sceneMap1, IN.baseTC.xy);    
+  half4 map2 = tex2D( sceneMap2, IN.baseTC.xy);   
+  
+  // 2.0, 1.15, 0.45 - handtweaked values to get nice sharp falloff
+  half4 cSum = ( map0 * 2.0 + map1 * 1.15 + map2 * 0.45 ); 
+  //float4 cSum = ( map0 * 1 + map1 * 1 + map2 ); 
+  //float4 cSum = ( map0 + map1  + map2  ); 
+  
+  // Use rgbs if fp16 filtering not supported
+  #if !%BILINEAR_FP16  
+    cSum = EncodeHDRGlowMaps( map0, map1, map2 );
+  #endif     
+  
+  OUT.Color = cSum;
+  
+  return OUT;
+}
+
+////////////////// technique /////////////////////
+technique ComposeFinalHDRGlow
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS BaseVS();            
+    PixelShader = compile PROFILE_PS ComposeFinalHDRGlowPS();
+    CullMode = None;        
+  }
+}
+
+struct app2vertLI
+{
+  float4 Position  : POSITION;
+  float2 baseTC0    : TEXCOORD0;
+  float3 baseTC1    : TEXCOORD1;
+};
+
+struct vert2fragLI
+{
+  float4 HPosition  : POSITION;
+  float4 Info0      : TEXCOORD0;
+  float4 Info1      : TEXCOORD1;
+};
+
+vert2fragLI LightInfoVS(app2vertLI IN)
+{
+  vert2fragLI OUT = (vert2fragLI)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.HPosition = vPos;
+  OUT.Info0.xy = IN.baseTC0.xy;
+  OUT.Info1.zw = IN.baseTC1.xy;
+  
+  return OUT;
+}
+
+
+pixout LightInfoPS(vert2fragLI IN)
+{
+  pixout OUT;
+	  
+  OUT.Color.xy = IN.Info0.xy;
+  OUT.Color.zw = IN.Info1.xy;
+
+  return OUT;
+}
+
+
+// HDR post-processing techniques
+
+technique HDRDownScale2x2
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRDownscale2x2PS();
+  }
+}
+
+technique HDRDownScale4x4
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRDownscale4x4PS();
+  }
+}
+
+technique HDRDownScale4x4MRT
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRDownscale4x4MRTPS();
+  }
+}
+
+technique HDRDownScale4x4MRTSafe
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRDownscale4x4MRTSafePS();
+  }
+}
+
+technique HDRCutPercentileInitial
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRCutPercentileInitialPS();
+  }
+}
+technique HDRCutPercentileIterative
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRCutPercentileIterativePS();
+  }
+}
+
+technique HDRCutPercentileFinal
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRCutPercentileFinalPS();
+  }
+}
+
+technique HDRSampleLumInitial
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRSampleLumInitialPS();
+  }
+}
+
+technique HDRSampleLumIterative
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRSampleLumIterativePS();
+  }
+}
+
+technique HDRSampleLumFinal
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRSampleLumFinalPS();
+  }
+}
+
+technique HDRCalculateAdaptedLum
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRCalculateAdaptedLumPS();
+  }
+}
+
+technique HDRBrightPassFilter
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRBrightPassFilterPS();
+  }
+}
+
+technique HDRGaussBlur5x5
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRGaussBlur5x5PS();
+  }
+}
+
+technique HDRBloom
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRBloomPS();
+  }
+}
+
+technique HDRMergeTextures
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRMergeTexturesPS();
+  }
+}
+
+technique HDRFinalPass
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS TransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRFinalScenePS();
+  }
+}
+
+technique HDRFinalDebugPass
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS HDRFinalDebugScenePS();
+  }
+}
+
+technique FogPass
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedFogVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS FogPassPS();
+  }
+}
+
+technique FogPassWithLightning
+{
+  pass p0
+  {    
+    VertexShader = compile PROFILE_VS PreTransformedFogVS();
+    PixelShader = compile PROFILE_PS FogPassWithLightningPS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+technique Encode_ToLDR
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS EncodeHDRPS();
+  }
+}
+
+technique DownScale4x4
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS Downscale4x4PS();
+  }
+}
+
+technique DownScale4x4_EncodeLDR
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS PreTransformedVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS Downscale4x4_ToLDRPS();
+  }
+}
+
+technique LightInfo
+{
+  pass p0
+  {
+    VertexShader = compile PROFILE_VS LightInfoVS();
+    
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = compile PROFILE_PS LightInfoPS();
+  }
+}

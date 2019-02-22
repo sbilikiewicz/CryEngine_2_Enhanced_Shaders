@@ -1,0 +1,3 @@
+ *.* linguist-language=cpp
+*.cfx text diff=cpp
+*.cfi text diff=cpp
